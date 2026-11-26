@@ -938,3 +938,12 @@ mod tests {
         }
     }
 }
+
+/// Every empty block of staging buffers let go (an upload buffer was
+/// refused: the PC's memory shared with the card is full): the bytes let go.
+pub(crate) fn relieve_staging() -> u64 {
+    let mut pool = lock(&STAGING);
+    let before = pool.blocks();
+    pool.reclaim(now(), 0, true);
+    (before - pool.blocks()) as u64 * BLOCK
+}

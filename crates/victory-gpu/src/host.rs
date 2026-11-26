@@ -2025,6 +2025,22 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Every spare scratch chunk let go (an upload buffer was refused). The
+/// number let go.
+fn relieve_scratch() -> usize {
+    let kept = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    ALIVE[3].fetch_sub(kept.len() as u64, Ordering::Relaxed);
+    let bytes = kept.iter().map(|k| k.1).sum::<u64>();
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(kept.len() as u64, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    kept.len()
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -8754,6 +8770,27 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(made) = self.upload_buffer_once(size, false) {
+            return Some(made);
+        }
+        // Refused (the PC's memory shared with the card is full on a 16 GB
+        // PC): what is only kept for later goes, and it is tried again.
+        let lists = crate::list::relieve();
+        let chunks = relieve_scratch();
+        let staging = crate::texture::relieve_staging();
+        let made = self.upload_buffer_once(size, true);
+        tracing::warn!(
+            size,
+            idle_lists_let_go = lists,
+            scratch_chunks_let_go = chunks,
+            staging_mb_let_go = staging >> 20,
+            made_then = made.is_some(),
+            "an upload buffer was refused: what was kept for later is let go and it is tried again"
+        );
+        made
+    }
+
+    fn upload_buffer_once(&self, size: u64, again: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -8802,7 +8839,9 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
+                if again {
+                    tracing::warn!(error = %e, size, "no upload buffer");
+                }
                 None
             }
         }

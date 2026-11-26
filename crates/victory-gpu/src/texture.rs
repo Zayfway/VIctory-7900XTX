@@ -2304,3 +2304,9 @@ mod allocation_costs {
         }
     }
 }
+
+/// Every spare staging block let go (an upload buffer was refused): the
+/// bytes let go (`crate::pool::relieve_staging`).
+pub(crate) fn relieve_staging() -> u64 {
+    crate::pool::relieve_staging()
+}

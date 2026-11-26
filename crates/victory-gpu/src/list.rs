@@ -234,6 +234,80 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// The most host lists kept idle now. Each keeps its command allocators,
+/// which live in the PC's memory shared with the card: on a 16 GB PC that
+/// is some 7.5 GB, and with 512 idle lists and the ones in flight (969 in
+/// run bakeonly) upload buffers were refused and the title went down two
+/// minutes into the opening cutscene. So the pool shrinks as that memory
+/// fills (after avatarmanz/VIctory-7900XTX#92): 512 under 70 % of its
+/// budget, 96 under 86 %, 32 under 92 %, none above, looked at every
+/// 250 ms. `VICTORY_LIST_POOL_MOST=<n>` fixes the count.
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(n) = *FIXED.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.trim().parse().ok())
+    }) {
+        return n;
+    }
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    static LOOKED: AtomicU64 = AtomicU64::new(0);
+    static MOST: AtomicUsize = AtomicUsize::new(IDLE_MOST.0);
+    let now = crate::host::now_ms();
+    if now.saturating_sub(LOOKED.load(Ordering::Relaxed)) >= 250 {
+        LOOKED.store(now, Ordering::Relaxed);
+        if let Some([_, _, budget, used]) = crate::host::host().and_then(|h| h.video_memory())
+            && budget > 0
+        {
+            let percent = used * 100 / budget;
+            let most = match percent {
+                0..70 => IDLE_MOST.0,
+                70..86 => 96,
+                86..92 => 32,
+                _ => 0,
+            };
+            let before = MOST.swap(most, Ordering::Relaxed);
+            if before != most {
+                tracing::info!(
+                    shared_used_mb = used >> 20,
+                    shared_budget_mb = budget >> 20,
+                    idle_lists_at_most = most,
+                    "the PC's memory shared with the card: the pool of idle host lists is resized"
+                );
+                if most < before {
+                    trim_idle(most);
+                }
+            }
+        }
+    }
+    MOST.load(Ordering::Relaxed)
+}
+
+/// Idle host lists past `most` are let go, with their allocators.
+#[cfg(windows)]
+fn trim_idle(most: usize) -> usize {
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= most {
+            return 0;
+        }
+        let gone = idle.0.split_off(most);
+        idle.1 -= gone.iter().map(|g| g.1).sum::<u64>();
+        gone
+    };
+    // (Freed outside the lock: freeing allocators takes the kernel's time.)
+    let n = gone.len();
+    drop(gone);
+    n
+}
+
+/// Every idle host list let go: for a creation the system refused for
+/// lack of memory, before it is tried again. The number let go.
+#[cfg(windows)]
+pub(crate) fn relieve() -> usize {
+    trim_idle(0)
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -273,7 +347,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let most = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,7 +356,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
